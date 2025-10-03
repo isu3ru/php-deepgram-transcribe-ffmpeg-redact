@@ -11,109 +11,88 @@ class RedactService
     {
         $dotenv = \Dotenv\Dotenv::createImmutable(__DIR__ . '/../../');
         $dotenv->load();
+
         $ffmpegPath = $_ENV['FFMPEG_BINARY_PATH'] ?? 'ffmpeg';
-        $redactedDir = __DIR__ . '/../../redacted';
+        // dd($_ENV['FFMPEG_BINARY_PATH'], $ffmpegPath);
+        $redactedDir = __DIR__ . '/../../public/redacted';
         if (!is_dir($redactedDir)) {
             mkdir($redactedDir, 0777, true);
         }
-        $beepsDir = __DIR__ . '/../../beeps';
-        if (!is_dir($beepsDir)) {
-            mkdir($beepsDir, 0777, true);
-        }
         $outputFile = realpath($redactedDir) . DIRECTORY_SEPARATOR . uniqid('redacted_') . '.mp3';
 
-        // Download audio file locally if it's a remote URL
+        // Download audio file
         $inputFile = realpath(__DIR__ . '/../../downloads/') . DIRECTORY_SEPARATOR . time() . '.mp3';
         file_put_contents($inputFile, file_get_contents($audioUrl));
 
+        // get words
         $words = $transcript['results']['channels'][0]['alternatives'][0]['words'];
 
         // Parse transcript for redactable segments (numbers, PCI, etc.).
-        // Expecting transcript to be a Deepgram response with word-level timing and redaction info
         $redactSegments = [];
         if (is_array($transcript) && isset($words)) {
             foreach ($words as $word) {
+                // checking for square brackets which Deepgram uses to indicate redacted words
                 if (preg_match('/^\[.*\]$/', $word['word'])) {
                     $redactSegments[] = $word;
                 }
             }
         }
 
-        // Generate individual beep files for each redacted word and overlay on redact segments using ffmpeg
-        $beepFiles = [];
-        foreach ($redactSegments as $i => $seg) {
-            $beepDuration = $seg['end'] - $seg['start'];
-            $beepFile = $beepsDir . DIRECTORY_SEPARATOR . 'beep_' . $i . '_' . time() . '.mp3';
-            $beepCmd = "$ffmpegPath -f lavfi -i sine=frequency=1000:duration=$beepDuration -q:a 9 -acodec libmp3lame $beepFile";
-            $ret = shell_exec($beepCmd);
-            if (!file_exists($beepFile)) {
-                throw new \Exception("Beep file was not created: $beepFile\nCommand: $beepCmd\nOutput: $ret");
-            }
-            $beepFiles[] = realpath($beepFile);
-        }
+        // Use PHP-FFMpeg for audio processing
+        $ffmpeg = \FFMpeg\FFMpeg::create([
+            'ffmpeg.binaries'  => $_ENV['FFMPEG_BINARY_PATH'],
+            'ffprobe.binaries' => $_ENV['FFPROBE_BINARY_PATH'], // need ffprobe as well. 
+        ]);
+        $audio = $ffmpeg->open($inputFile);
 
-        // Build ffmpeg filter for reconstructing full audio with beeps replacing redacted segments
-        $filter = '';
-        $concatLabels = [];
+        $segments = [];
         $lastEnd = 0.0;
-        $beepInputOffset = 1; // beep files start from input 1
+        // create redacted word segments with beep
         foreach ($redactSegments as $i => $seg) {
             // Unredacted segment before this redacted word
             if ($seg['start'] > $lastEnd) {
-                $filter .= "[0:a]atrim=start=$lastEnd:end={$seg['start']},asetpts=PTS-STARTPTS[orig{$i}];";
-                $concatLabels[] = "[orig{$i}]";
+                $segmentFile = sys_get_temp_dir() . DIRECTORY_SEPARATOR . uniqid('orig_') . '.mp3';
+                $audio->filters()->clip(\FFMpeg\Coordinate\TimeCode::fromSeconds($lastEnd), \FFMpeg\Coordinate\TimeCode::fromSeconds($seg['start'] - $lastEnd));
+                $audio->save(new \FFMpeg\Format\Audio\Mp3(), $segmentFile);
+                $segments[] = $segmentFile;
             }
-            // Redacted segment: use beep only
-            $filter .= "[" . ($beepInputOffset + $i) . ":a]atrim=start=0:end=" . ($seg['end'] - $seg['start']) . ",asetpts=PTS-STARTPTS[beep{$i}];";
-            $concatLabels[] = "[beep{$i}]";
+            // Redacted segment: generate beep and use as segment
+            $beepDuration = $seg['end'] - $seg['start'];
+            $beepFile = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'beep_' . $i . '_' . time() . '.mp3';
+            $cmd = "$ffmpegPath -f lavfi -i sine=frequency=1000:duration=$beepDuration -q:a 9 -acodec libmp3lame $beepFile";
+            shell_exec($cmd);
+            $segments[] = $beepFile;
             $lastEnd = $seg['end'];
         }
         // Add final unredacted segment after last redacted word
-        $audioDurationCmd = "$ffmpegPath -i '$inputFile' 2>&1";
-        preg_match('/Duration: ([0-9:.]+)/', shell_exec($audioDurationCmd), $matches);
-        $audioDuration = 0.0;
-        if (isset($matches[1])) {
-            list($h, $m, $s) = sscanf($matches[1], "%d:%d:%f");
-            $audioDuration = $h * 3600 + $m * 60 + $s;
-        }
+        $ffprobe = $ffmpeg->getFFProbe();
+        $audioDuration = $ffprobe->format($inputFile)->get('duration');
         if ($lastEnd < $audioDuration) {
-            $filter .= "[0:a]atrim=start=$lastEnd:end=$audioDuration,asetpts=PTS-STARTPTS[orig_end];";
-            $concatLabels[] = "[orig_end]";
-        }
-        // Concatenate all segments
-        if (!empty($concatLabels)) {
-            $filter .= implode('', $concatLabels) . "concat=n=" . count($concatLabels) . ":v=0:a=1[aout];";
+            $segmentFile = sys_get_temp_dir() . DIRECTORY_SEPARATOR . uniqid('orig_') . '.mp3';
+            $audio->filters()->clip(
+                \FFMpeg\Coordinate\TimeCode::fromSeconds($lastEnd),
+                \FFMpeg\Coordinate\TimeCode::fromSeconds($audioDuration - $lastEnd)
+            );
+            $audio->save(new \FFMpeg\Format\Audio\Mp3(), $segmentFile);
+            $segments[] = $segmentFile;
         }
 
-        // If no segments, just copy audio
-        if (empty($redactSegments)) {
-            echo 'copying the audio without redaction';
-            shell_exec("$ffmpegPath -i '$inputFile' -acodec libmp3lame '$outputFile'");
-        } else {
-            echo 'applying redaction to the audio<br/>';
-            // Build input list for ffmpeg command
-            $inputList = "-i '$inputFile'";
-            foreach ($beepFiles as $beepFile) {
-                $inputList .= " -i '$beepFile'";
-            }
-            // apply redaction to audio
-            $cmd = "$ffmpegPath $inputList -filter_complex '$filter' -map '[aout]' -acodec libmp3lame '$outputFile'";
-            // Basic example
-            $command = new Command($cmd);
-            if ($command->execute()) {
-                dd($command->getOutput());
-            } else {
-                dd("Error executing command: " . $command->getError(), "Command: $cmd");
-            }
-            // dd($ret, $cmd);
-            // echo $cmd;
+        // Concatenate all segments using PHP-FFMpeg
+        $concatList = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'concat_' . uniqid() . '.txt';
+        $fh = fopen($concatList, 'w');
+        foreach ($segments as $segFile) {
+            fwrite($fh, "file '$segFile'\n");
         }
+        fclose($fh);
+        $concatCmd = "$ffmpegPath -f concat -safe 0 -i $concatList -c copy $outputFile";
+        shell_exec($concatCmd);
 
         // Clean up temp files
         @unlink($inputFile);
-        foreach ($beepFiles as $beepFile) {
-            @unlink($beepFile);
+        foreach ($segments as $segFile) {
+            @unlink($segFile);
         }
+        @unlink($concatList);
 
         return $outputFile;
     }

@@ -1,0 +1,8 @@
+# Ignore all files in beeps, downloads, and public/redacted but keep the folders
+beeps/*
+!beeps/.gitkeep
+downloads/*
+!downloads/.gitkeep
+public/redacted/*
+!public/redacted/.gitkeep
+.env

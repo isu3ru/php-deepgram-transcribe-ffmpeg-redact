@@ -22,9 +22,10 @@ class TranscribeController
         $redact = new RedactService();
         $outputFile = $redact->redactAudio($audioUrl, $transcript);
         if ($outputFile) {
-            echo "<p>Redacted audio saved: <a href='/../redacted/" . basename($outputFile) . "'>" . basename($outputFile) . "</a></p>";
+            $audioFile = '/redacted/' . basename($outputFile);
+            include __DIR__ . '/../View/result.php';
         } else {
-            echo 'Redaction failed.';
+            include __DIR__ . '/../View/error.php';
         }
     }
 }
